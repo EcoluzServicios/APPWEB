@@ -150,9 +150,9 @@ input,select{width:100%;border:1px solid var(--line);background:#fff;border-radi
 </div></div></div>
 <script>
 const API_URL='https://script.google.com/macros/s/AKfycbyrvWMZSJNqBM2KLr-Pn_HUGJaLrXuoVxTTsCNqsbRaajx6aHJCgO0H9gLj2juT_u8urQ/exec';
-const APP_KEY='ecoluz_asistencia_v10_sync_real';
-const DEVICE_KEY='ecoluz_asistencia_device_id_v10_sync_real';
-const LOCAL_ADMIN_SESSION_KEY='ecoluz_asistencia_admin_session_v10';
+const APP_KEY='ecoluz_asistencia_v11_sync_real';
+const DEVICE_KEY='ecoluz_asistencia_device_id_v11_sync_real';
+const LOCAL_ADMIN_SESSION_KEY='ecoluz_asistencia_admin_session_v11';
 const DEFAULT_ADMIN_PASSWORD='admin123';
 const OFFICIAL_GPS={lat:'-20.219926', lng:'-70.142125', radius:50};
 
@@ -477,7 +477,7 @@ qs('adminBack').onclick=()=>screen('screenLogin');
 
 async function mark(kind){
   if(markInFlight) return;
-  const worker=workerByCode(currentWorkerCode); 
+  const worker=workerByCode(currentWorkerCode);
   if(!worker) return;
   const hist=getTodayHistory(worker);
   if(kind==='arrival' && hist.arrival) return;
@@ -487,9 +487,11 @@ async function mark(kind){
 
   let gps={ok:true,distance:null,coords:null};
   const meta=kindMeta(kind);
+  const field=kind==='arrival'?'arrival':kind==='lunchStart'?'lunchStart':kind==='lunchEnd'?'lunchEnd':'exit';
 
   try{
     markInFlight=true;
+    message(qs('workerNotice'),'info','Registrando marcaje...');
     renderWorker();
 
     gps=await validateGpsForMark(kind);
@@ -498,7 +500,6 @@ async function mark(kind){
       return;
     }
 
-    message(qs('workerNotice'),'info','Registrando marcaje...');
     const payload={action:'marcar',codigo:worker.code,tipo:meta.api,device_id:deviceId(),estado:statusForToday(worker).text};
     if(gps.coords){
       payload.lat=String(gps.coords.lat);
@@ -514,22 +515,24 @@ async function mark(kind){
       return;
     }
 
+    const h=getTodayHistory(worker);
     if(r.data?.today_marks){
       applyTodayMarks(worker,r.data.today_marks);
     }else{
-      await refreshWorkerTodayMarks(worker.code);
+      h[field]={
+        time:String(r.data?.hora||timeNow()).slice(0,5),
+        distance:r.data?.distancia_m==null||r.data?.distancia_m===''? (gps.distance==null?null:Number(gps.distance)) : Number(r.data.distancia_m),
+        coords:gps.coords||null
+      };
     }
 
     renderWorker();
+    message(qs('workerNotice'), r.data?.duplicate ? 'info' : 'ok', r.data?.mensaje || meta.success);
 
-    if(r.data?.duplicate){
-      message(qs('workerNotice'),'info',r.data?.mensaje||'Ese marcaje ya existía y se recuperó el estado real del día.');
-    }else{
-      const updated=getTodayHistory(worker);
-      const field=kind==='arrival'?'arrival':kind==='lunchStart'?'lunchStart':kind==='lunchEnd'?'lunchEnd':'exit';
-      const shown=updated[field];
-      message(qs('workerNotice'),'ok',meta.success+(shown&&shown.distance!=null?` Distancia: ${Math.round(shown.distance)} m.`:''));
-    }
+    try{
+      await refreshWorkerTodayMarks(worker.code);
+      renderWorker();
+    }catch(_e){}
   }catch(e){
     message(qs('workerNotice'),'warn',e.message||'No fue posible registrar el marcaje.');
   }finally{
