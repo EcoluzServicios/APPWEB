@@ -204,6 +204,23 @@ function ensureWorkerCache(code,name){
   saveState(state);
   return w;
 }
+function getTodayHistory(worker){const key=todayKey(); if(!worker.history[key]) worker.history[key]={arrival:null,lunchStart:null,lunchEnd:null,exit:null}; return worker.history[key];}
+function normalizeRemoteMark(obj){
+  if(!obj) return null;
+  return {
+    time:String(obj.time||'').slice(0,5),
+    distance:obj.distance==null||obj.distance===''?null:Number(obj.distance),
+    coords:(obj.lat!=null && obj.lng!=null)?{lat:Number(obj.lat),lng:Number(obj.lng)}:null
+  };
+}
+function applyTodayMarks(worker,todayMarks){
+  if(!worker) return;
+  const h=getTodayHistory(worker);
+  h.arrival=normalizeRemoteMark(todayMarks?.arrival);
+  h.lunchStart=normalizeRemoteMark(todayMarks?.lunchStart);
+  h.lunchEnd=normalizeRemoteMark(todayMarks?.lunchEnd);
+  h.exit=normalizeRemoteMark(todayMarks?.exit);
+}
 function mergeWorkersFromServer(rows){
   rows.forEach(r=>{
     const code=String(r.codigo||'').trim();
@@ -219,35 +236,19 @@ function mergeWorkersFromServer(rows){
     w.boundDeviceId=String(r.device_id||'').trim();
     w.boundDeviceLabel=w.boundDeviceId?'Vinculado en servidor':'';
     if(!w.history) w.history={};
-    mergeTodayMarksIntoWorker(w, r.today_marks);
+    applyTodayMarks(w,r.today_marks||null);
   });
   state.workers=state.workers.sort((a,b)=>String(a.code).localeCompare(String(b.code),undefined,{numeric:true}));
   saveState(state);
 }
-function emptyHistoryDay(){return {arrival:null,lunchStart:null,lunchEnd:null,exit:null};}
-function getTodayHistory(worker){const key=todayKey(); if(!worker.history[key]) worker.history[key]=emptyHistoryDay(); return worker.history[key];}
-function mergeTodayMarksIntoWorker(worker, marks, key=todayKey()){
-  if(!worker.history) worker.history={};
-  worker.history[key]={...emptyHistoryDay(), ...(marks||{})};
-  return worker.history[key];
-}
-async function fetchTodayMarksForWorker(code){
-  const r=await apiPost({action:'worker_today_marks',codigo:code,device_id:deviceId(),fecha:todayKey()});
-  if(!r.ok) throw new Error(r.data?.mensaje||'No se pudo obtener el marcaje del día.');
-  const worker=ensureWorkerCache(code,r.data?.nombre||('Trabajador '+code));
-  mergeTodayMarksIntoWorker(worker, r.data?.today_marks||{});
+async function refreshWorkerTodayMarks(code){
+  const worker=workerByCode(code);
+  if(!worker) return null;
+  const r=await apiPost({action:'worker_today_marks',codigo:code,device_id:deviceId()});
+  if(!r.ok) throw new Error(r.data?.mensaje||'No se pudo cargar el marcaje del día.');
+  applyTodayMarks(worker,r.data?.today_marks||null);
   saveState(state);
   return worker;
-}
-async function refreshCurrentWorkerFromServer(silent=false){
-  const code=currentWorkerCode;
-  if(!code) return;
-  try{
-    await fetchTodayMarksForWorker(code);
-    renderWorker();
-  }catch(e){
-    if(!silent) message(qs('workerNotice'),'warn',e.message||'No fue posible actualizar tu marcaje del día.');
-  }
 }
 function statusForToday(worker){const cfg=state.config, h=getTodayHistory(worker); if(h.exit) return {text:'Jornada cerrada',cls:'info'}; if(h.arrival){const t=parseTime(h.arrival.time), limit=parseTime(cfg.start)+Number(cfg.tolerance||0); return t<=limit?{text:'Presente',cls:'ok'}:{text:'Atrasado',cls:'warn'};} if(nowMinutes()>=parseTime(cfg.start)+Number(cfg.noMark||0)) return {text:'Pendiente sin ingreso',cls:'danger'}; return {text:'Pendiente',cls:'info'};}
 function scheduleText(){const c=state.config; return `${c.start} a ${c.lunchStart} / ${c.lunchEnd} a ${c.end}`;}
@@ -367,8 +368,9 @@ qs('btnLogin').onclick=async()=>{
     if(!r.ok) return message(qs('loginMsg'),'warn',r.data?.mensaje||'Número o clave incorrecta.');
     const data=r.data;
     const worker=ensureWorkerCache(data.codigo||code,data.nombre||('Trabajador '+code));
-    worker.boundDeviceId=deviceId(); worker.boundDeviceLabel=navigator.userAgent.slice(0,60); worker.mustChange=!!data.debe_cambiar; mergeTodayMarksIntoWorker(worker, data.today_marks||{}); saveState(state);
+    worker.boundDeviceId=deviceId(); worker.boundDeviceLabel=navigator.userAgent.slice(0,60); worker.mustChange=!!data.debe_cambiar; saveState(state);
     qs('loginPass').value='';
+    try{ await refreshWorkerTodayMarks(worker.code); }catch(_e){}
     if(data.debe_cambiar){
       pendingPasswordChange={codigo:worker.code,nombre:worker.name,claveActual:pass};
       qs('changeWorkerInfo').textContent=`${worker.name} · Código ${worker.code}`;
@@ -380,7 +382,6 @@ qs('btnLogin').onclick=async()=>{
     currentWorkerCode=worker.code;
     qs('loginCode').value=''; qs('loginMsg').innerHTML='';
     renderWorker(); screen('screenWorker');
-    await refreshCurrentWorkerFromServer(true);
   }catch(e){message(qs('loginMsg'),'warn',e.message||'No fue posible iniciar sesión.');}
 };
 qs('btnChangePassword').onclick=async()=>{
@@ -394,7 +395,6 @@ qs('btnChangePassword').onclick=async()=>{
     const worker=ensureWorkerCache(pendingPasswordChange.codigo,pendingPasswordChange.nombre); worker.mustChange=false; saveState(state);
     currentWorkerCode=worker.code; pendingPasswordChange=null;
     qs('changePassMsg').innerHTML=''; renderWorker(); screen('screenWorker');
-    await refreshCurrentWorkerFromServer(true);
     message(qs('workerNotice'),'ok','Clave actualizada correctamente.');
   }catch(e){message(qs('changePassMsg'),'warn',e.message||'No fue posible cambiar la clave.');}
 };
@@ -435,12 +435,9 @@ async function mark(kind){
     if(gps.coords){payload.lat=String(gps.coords.lat); payload.lng=String(gps.coords.lng);} else {payload.lat=''; payload.lng='';}
     const r=await apiPost(payload);
     if(!r.ok) return message(qs('workerNotice'),'warn',r.data?.mensaje||'No fue posible registrar el marcaje.');
-    const mark={time:r.data?.hora||timeNow(), distance:r.data?.distancia_m ?? gps.distance, coords:gps.coords};
-    if(r.data?.today_marks){
-      mergeTodayMarksIntoWorker(worker, r.data.today_marks);
-    }else{
-      hist[kind==='arrival'?'arrival':kind==='lunchStart'?'lunchStart':kind==='lunchEnd'?'lunchEnd':'exit']=mark;
-    }
+    try{ await refreshWorkerTodayMarks(worker.code); }catch(_e){}
+    const h2=getTodayHistory(worker);
+    const mark=h2[kind==='arrival'?'arrival':kind==='lunchStart'?'lunchStart':kind==='lunchEnd'?'lunchEnd':'exit'] || {time:r.data?.hora||timeNow(), distance:r.data?.distancia_m ?? gps.distance, coords:gps.coords};
     saveState(state); renderWorker();
     message(qs('workerNotice'),'ok',meta.success+(mark.distance!=null?` Distancia: ${Math.round(mark.distance)} m.`:''));
   }catch(e){message(qs('workerNotice'),'warn',e.message||'No fue posible registrar el marcaje.');}
@@ -479,6 +476,12 @@ qs('exportExcel').onclick=()=>{
 syncConfigToForm();
 updateHeaderBoxes();
 saveState(state);
+(async()=>{
+  try{
+    if(currentWorkerCode) await refreshWorkerTodayMarks(currentWorkerCode);
+    if(currentAdminPassword){ await fetchWorkersForAdmin(); if(qs('screenAdmin').classList.contains('active')) renderAdmin(); }
+  }catch(_e){}
+})();
 </script>
 <script>
 if ('serviceWorker' in navigator) {
