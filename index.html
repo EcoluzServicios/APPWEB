@@ -153,6 +153,7 @@ const API_URL='https://script.google.com/macros/s/AKfycbyrvWMZSJNqBM2KLr-Pn_HUGJ
 const APP_KEY='ecoluz_asistencia_v11_sync_real';
 const DEVICE_KEY='ecoluz_asistencia_device_id_v11_sync_real';
 const LOCAL_ADMIN_SESSION_KEY='ecoluz_asistencia_admin_session_v11';
+const WORKER_SESSION_KEY='ecoluz_asistencia_worker_session_v1';
 const DEFAULT_ADMIN_PASSWORD='admin123';
 const OFFICIAL_GPS={lat:'-20.219926', lng:'-70.142125', radius:50};
 
@@ -168,6 +169,49 @@ function distanceMeters(a,b,c,d){const R=6371000,toRad=x=>x*Math.PI/180; const d
 function qs(id){return document.getElementById(id)}
 function screen(id){document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active')); qs(id).classList.add('active');}
 function message(el,type,txt){el.innerHTML=txt?`<div class="notice ${type}">${txt}</div>`:'';}
+function setWorkerNotice(type,txt){workerNoticeState={type:type||'',text:txt||''}; message(qs('workerNotice'),workerNoticeState.type,workerNoticeState.text);}
+function clearWorkerNotice(){workerNoticeState={type:'',text:''}; message(qs('workerNotice'),'','');}
+function loadWorkerSession(){
+  try{
+    const s=JSON.parse(localStorage.getItem(WORKER_SESSION_KEY)||'null');
+    if(!s || !s.code || !s.date) return null;
+    return s;
+  }catch(_e){
+    return null;
+  }
+}
+function saveWorkerSession(data){
+  const payload={code:String(data.code||''),date:todayKey(),mustChange:!!data.mustChange,name:data.name||''};
+  localStorage.setItem(WORKER_SESSION_KEY,JSON.stringify(payload));
+}
+function clearWorkerSession(){
+  localStorage.removeItem(WORKER_SESSION_KEY);
+}
+function isWorkerSessionExpired(session){
+  return !session || session.date!==todayKey();
+}
+function endWorkerSession(messageText){
+  currentWorkerCode='';
+  pendingPasswordChange=null;
+  stopWorkerAutoRefresh();
+  clearWorkerSession();
+  clearWorkerNotice();
+  qs('loginPass').value='';
+  screen('screenLogin');
+  if(messageText) message(qs('loginMsg'),'info',messageText);
+}
+function ensureWorkerSessionCurrentDay(messageText){
+  const s=loadWorkerSession();
+  if(isWorkerSessionExpired(s)){
+    if(currentWorkerCode || pendingPasswordChange){
+      endWorkerSession(messageText||'Tu sesión terminó porque cambió el día. Ingresa nuevamente.');
+    }else if(s){
+      clearWorkerSession();
+    }
+    return false;
+  }
+  return true;
+}
 function updateHeaderBoxes(){document.querySelectorAll('.config-details').forEach(d=>{const header=d.querySelector('.config-header'); if(header) header.classList.toggle('open', d.open);});}
 document.addEventListener('toggle', e=>{if(e.target.classList && e.target.classList.contains('config-details')) updateHeaderBoxes();}, true);
 
@@ -212,6 +256,7 @@ let currentWorkerCode='';
 let pendingPasswordChange=null;
 let currentAdminPassword=localStorage.getItem(LOCAL_ADMIN_SESSION_KEY)||'';
 let markInFlight=false;
+let workerNoticeState={type:'',text:''};
 
 function workerByCode(code){return state.workers.find(w=>String(w.code)===String(code))}
 function ensureWorkerCache(code,name){
@@ -311,7 +356,13 @@ function renderWorker(){
   qs('workerStateBadge').textContent=st.text;
   qs('todaySchedule').textContent='Jornada vigente: '+scheduleText();
   const note=(!hist.arrival && nowMinutes()>=parseTime(state.config.start)+Number(state.config.noMark||0))?'Aún no has marcado tu ingreso. Si ya llegaste al taller, regístralo ahora.':'';
-  message(qs('workerNotice'), note?'warn':'', note);
+  if(workerNoticeState.text){
+    message(qs('workerNotice'),workerNoticeState.type,workerNoticeState.text);
+  }else if(note){
+    message(qs('workerNotice'),'warn',note);
+  }else{
+    message(qs('workerNotice'),'','');
+  }
   qs('myDayRecords').innerHTML=[formatRecord('Ingreso',hist.arrival),formatRecord('Inicio colación',hist.lunchStart),formatRecord('Fin colación',hist.lunchEnd),formatRecord('Salida',hist.exit)].join('');
   const btnA=qs('btnArrival'), btnLS=qs('btnLunchStart'), btnLE=qs('btnLunchEnd'), btnX=qs('btnExit');
   btnA.disabled=markInFlight||!!hist.arrival; btnLS.disabled=markInFlight||!hist.arrival||!!hist.lunchStart; btnLE.disabled=markInFlight||!hist.lunchStart||!!hist.lunchEnd; btnX.disabled=markInFlight||!hist.arrival||!!hist.exit;
@@ -397,6 +448,7 @@ qs('btnLogin').onclick=async()=>{
     qs('loginPass').value='';
     try{ await refreshWorkerTodayMarks(worker.code); }catch(_e){}
     if(data.debe_cambiar){
+      saveWorkerSession({code:worker.code,name:worker.name,mustChange:true});
       pendingPasswordChange={codigo:worker.code,nombre:worker.name,claveActual:pass};
       qs('changeWorkerInfo').textContent=`${worker.name} · Código ${worker.code}`;
       qs('changeCurrent').value=pass; qs('changeNew').value=''; qs('changeRepeat').value='';
@@ -405,8 +457,9 @@ qs('btnLogin').onclick=async()=>{
       return;
     }
     currentWorkerCode=worker.code;
+    saveWorkerSession({code:worker.code,name:worker.name,mustChange:false});
     qs('loginCode').value=''; qs('loginMsg').innerHTML='';
-    renderWorker(); startWorkerAutoRefresh(); screen('screenWorker');
+    clearWorkerNotice(); renderWorker(); startWorkerAutoRefresh(); screen('screenWorker');
   }catch(e){message(qs('loginMsg'),'warn',e.message||'No fue posible iniciar sesión.');}
 };
 qs('btnChangePassword').onclick=async()=>{
@@ -419,11 +472,12 @@ qs('btnChangePassword').onclick=async()=>{
     if(!r.ok) return message(qs('changePassMsg'),'warn',r.data?.mensaje||'No fue posible cambiar la clave.');
     const worker=ensureWorkerCache(pendingPasswordChange.codigo,pendingPasswordChange.nombre); worker.mustChange=false; saveState(state);
     currentWorkerCode=worker.code; pendingPasswordChange=null;
-    qs('changePassMsg').innerHTML=''; renderWorker(); startWorkerAutoRefresh(); screen('screenWorker');
+    saveWorkerSession({code:worker.code,name:worker.name,mustChange:false});
+    qs('changePassMsg').innerHTML=''; clearWorkerNotice(); renderWorker(); startWorkerAutoRefresh(); screen('screenWorker');
     message(qs('workerNotice'),'ok','Clave actualizada correctamente.');
   }catch(e){message(qs('changePassMsg'),'warn',e.message||'No fue posible cambiar la clave.');}
 };
-qs('changePassBack').onclick=()=>{pendingPasswordChange=null; qs('changePassMsg').innerHTML=''; screen('screenLogin');};
+qs('changePassBack').onclick=()=>{pendingPasswordChange=null; clearWorkerSession(); qs('changePassMsg').innerHTML=''; screen('screenLogin');};
 qs('btnDemo').onclick=()=>{qs('loginCode').value='T001'; qs('loginPass').value='1234';};
 qs('btnGoAdmin').onclick=()=>screen('screenAdminLogin');
 qs('adminLoginBack').onclick=()=>screen('screenLogin');
@@ -432,6 +486,7 @@ let workerRefreshTimer=null;
 function startWorkerAutoRefresh(){
   if(workerRefreshTimer) clearInterval(workerRefreshTimer);
   workerRefreshTimer=setInterval(async()=>{
+    if(!ensureWorkerSessionCurrentDay()) return;
     if(!currentWorkerCode) return;
     try{
       await refreshWorkerTodayMarks(currentWorkerCode);
@@ -472,11 +527,12 @@ qs('btnAdminLogin').onclick=async()=>{
     message(qs('adminLoginMsg'),'warn',e.message||'Clave de administración incorrecta.');
   }
 };
-qs('workerBack').onclick=()=>{currentWorkerCode=''; stopWorkerAutoRefresh(); screen('screenLogin');};
+qs('workerBack').onclick=()=>{endWorkerSession('Sesión cerrada.');};
 qs('adminBack').onclick=()=>screen('screenLogin');
 
 async function mark(kind){
   if(markInFlight) return;
+  if(!ensureWorkerSessionCurrentDay('Tu sesión terminó porque cambió el día. Ingresa nuevamente.')) return;
   const worker=workerByCode(currentWorkerCode);
   if(!worker) return;
   const hist=getTodayHistory(worker);
@@ -491,12 +547,12 @@ async function mark(kind){
 
   try{
     markInFlight=true;
-    message(qs('workerNotice'),'info','Registrando marcaje...');
+    setWorkerNotice('info','Registrando marcaje...');
     renderWorker();
 
     gps=await validateGpsForMark(kind);
     if(!gps.ok){
-      message(qs('workerNotice'),'warn',`Estás fuera del rango permitido del taller. Distancia aproximada: ${Math.round(gps.distance)} m.`);
+      setWorkerNotice('warn',`Estás fuera del rango permitido del taller. Distancia aproximada: ${Math.round(gps.distance)} m.`);
       return;
     }
 
@@ -511,7 +567,7 @@ async function mark(kind){
 
     const r=await apiPost(payload);
     if(!r.ok){
-      message(qs('workerNotice'),'warn',r.data?.mensaje||'No fue posible registrar el marcaje.');
+      setWorkerNotice('warn',r.data?.mensaje||'No fue posible registrar el marcaje.');
       return;
     }
 
@@ -527,14 +583,14 @@ async function mark(kind){
     }
 
     renderWorker();
-    message(qs('workerNotice'), r.data?.duplicate ? 'info' : 'ok', r.data?.mensaje || meta.success);
+    setWorkerNotice(r.data?.duplicate ? 'info' : 'ok', r.data?.mensaje || meta.success);
 
     try{
       await refreshWorkerTodayMarks(worker.code);
       renderWorker();
     }catch(_e){}
   }catch(e){
-    message(qs('workerNotice'),'warn',e.message||'No fue posible registrar el marcaje.');
+    setWorkerNotice('warn',e.message||'No fue posible registrar el marcaje.');
   }finally{
     markInFlight=false;
     renderWorker();
@@ -571,12 +627,40 @@ qs('exportExcel').onclick=()=>{
   const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='asistencia_ecoluz_'+todayKey()+'.xls'; document.body.appendChild(a); a.click(); document.body.removeChild(a); setTimeout(()=>URL.revokeObjectURL(a.href),500);
 };
 
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden) ensureWorkerSessionCurrentDay('Tu sesión terminó porque cambió el día. Ingresa nuevamente.');
+});
+
+async function restoreWorkerSessionIfPossible(){
+  const session=loadWorkerSession();
+  if(!session) return;
+  if(isWorkerSessionExpired(session)){
+    clearWorkerSession();
+    return;
+  }
+  const worker=ensureWorkerCache(session.code,session.name||('Trabajador '+session.code));
+  try{ await refreshWorkerTodayMarks(worker.code); }catch(_e){}
+  if(session.mustChange){
+    pendingPasswordChange={codigo:worker.code,nombre:worker.name,claveActual:''};
+    qs('changeWorkerInfo').textContent=`${worker.name} · Código ${worker.code}`;
+    qs('changeCurrent').value=''; qs('changeNew').value=''; qs('changeRepeat').value='';
+    message(qs('changePassMsg'),'info','Debes cambiar tu clave provisoria para continuar.');
+    screen('screenChangePassword');
+    return;
+  }
+  currentWorkerCode=worker.code;
+  clearWorkerNotice();
+  renderWorker();
+  startWorkerAutoRefresh();
+  screen('screenWorker');
+}
+
 syncConfigToForm();
 updateHeaderBoxes();
 saveState(state);
 (async()=>{
   try{
-    if(currentWorkerCode){ await refreshWorkerTodayMarks(currentWorkerCode); startWorkerAutoRefresh(); }
+    await restoreWorkerSessionIfPossible();
     if(currentAdminPassword){ await fetchWorkersForAdmin(); if(qs('screenAdmin').classList.contains('active')) renderAdmin(); }
   }catch(_e){}
 })();
