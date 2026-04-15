@@ -188,6 +188,7 @@ let state=loadState();
 let currentWorkerCode='';
 let pendingPasswordChange=null;
 let currentAdminPassword=localStorage.getItem(LOCAL_ADMIN_SESSION_KEY)||'';
+let markInFlight=false;
 
 function workerByCode(code){return state.workers.find(w=>String(w.code)===String(code))}
 function ensureWorkerCache(code,name){
@@ -293,7 +294,7 @@ function renderWorker(){
   message(qs('workerNotice'), note?'warn':'', note);
   qs('myDayRecords').innerHTML=[formatRecord('Ingreso',hist.arrival),formatRecord('Inicio colación',hist.lunchStart),formatRecord('Fin colación',hist.lunchEnd),formatRecord('Salida',hist.exit)].join('');
   const btnA=qs('btnArrival'), btnLS=qs('btnLunchStart'), btnLE=qs('btnLunchEnd'), btnX=qs('btnExit');
-  btnA.disabled=!!hist.arrival; btnLS.disabled=!hist.arrival||!!hist.lunchStart; btnLE.disabled=!hist.lunchStart||!!hist.lunchEnd; btnX.disabled=!hist.arrival||!!hist.exit;
+  btnA.disabled=markInFlight||!!hist.arrival; btnLS.disabled=markInFlight||!hist.arrival||!!hist.lunchStart; btnLE.disabled=markInFlight||!hist.lunchStart||!!hist.lunchEnd; btnX.disabled=markInFlight||!hist.arrival||!!hist.exit;
   btnA.textContent=hist.arrival?`Ingreso registrado · ${hist.arrival.time}`:'Marcar ingreso';
   btnLS.textContent=hist.lunchStart?`Colación iniciada · ${hist.lunchStart.time}`:'Iniciar colación';
   btnLE.textContent=hist.lunchEnd?`Colación terminada · ${hist.lunchEnd.time}`:'Terminar colación';
@@ -417,6 +418,7 @@ qs('workerBack').onclick=()=>{currentWorkerCode=''; screen('screenLogin');};
 qs('adminBack').onclick=()=>screen('screenLogin');
 
 async function mark(kind){
+  if(markInFlight) return;
   const worker=workerByCode(currentWorkerCode); if(!worker) return;
   const hist=getTodayHistory(worker);
   if(kind==='arrival' && hist.arrival) return;
@@ -425,22 +427,52 @@ async function mark(kind){
   if(kind==='exit' && (!hist.arrival||hist.exit)) return;
   let gps={ok:true,distance:null,coords:null};
   try{
+    markInFlight=true;
+    renderWorker();
     gps=await validateGpsForMark(kind);
-    if(!gps.ok) return message(qs('workerNotice'),'warn',`Estás fuera del rango permitido del taller. Distancia aproximada: ${Math.round(gps.distance)} m.`);
-  }catch(e){return message(qs('workerNotice'),'warn',e.message);}
+    if(!gps.ok){
+      message(qs('workerNotice'),'warn',`Estás fuera del rango permitido del taller. Distancia aproximada: ${Math.round(gps.distance)} m.`);
+      return;
+    }
+  }catch(e){
+    message(qs('workerNotice'),'warn',e.message);
+    return;
+  }
   const meta=kindMeta(kind);
   message(qs('workerNotice'),'info','Registrando marcaje...');
   try{
     const payload={action:'marcar',codigo:worker.code,tipo:meta.api,device_id:deviceId(),estado:statusForToday(worker).text};
     if(gps.coords){payload.lat=String(gps.coords.lat); payload.lng=String(gps.coords.lng);} else {payload.lat=''; payload.lng='';}
     const r=await apiPost(payload);
-    if(!r.ok) return message(qs('workerNotice'),'warn',r.data?.mensaje||'No fue posible registrar el marcaje.');
-    try{ await refreshWorkerTodayMarks(worker.code); }catch(_e){}
+    if(!r.ok){
+      message(qs('workerNotice'),'warn',r.data?.mensaje||'No fue posible registrar el marcaje.');
+      return;
+    }
+
+    // Prefer the backend response for today's marks.
+    if(r.data?.today_marks){
+      applyTodayMarks(worker,r.data.today_marks);
+    }else{
+      try{ await refreshWorkerTodayMarks(worker.code); }catch(_e){}
+    }
+
+    // Fallback: if the backend did not return marks, reflect at least this click locally.
     const h2=getTodayHistory(worker);
-    const mark=h2[kind==='arrival'?'arrival':kind==='lunchStart'?'lunchStart':kind==='lunchEnd'?'lunchEnd':'exit'] || {time:r.data?.hora||timeNow(), distance:r.data?.distancia_m ?? gps.distance, coords:gps.coords};
-    saveState(state); renderWorker();
-    message(qs('workerNotice'),'ok',meta.success+(mark.distance!=null?` Distancia: ${Math.round(mark.distance)} m.`:''));
-  }catch(e){message(qs('workerNotice'),'warn',e.message||'No fue posible registrar el marcaje.');}
+    const key=kind==='arrival'?'arrival':kind==='lunchStart'?'lunchStart':kind==='lunchEnd'?'lunchEnd':'exit';
+    if(!h2[key]){
+      h2[key]={time:String(r.data?.hora||timeNow()).slice(0,5),distance:r.data?.distancia_m ?? gps.distance,coords:gps.coords||null};
+    }
+
+    saveState(state);
+    renderWorker();
+    const shown=getTodayHistory(worker)[key];
+    message(qs('workerNotice'),'ok',meta.success+(shown&&shown.distance!=null?` Distancia: ${Math.round(shown.distance)} m.`:''));
+  }catch(e){
+    message(qs('workerNotice'),'warn',e.message||'No fue posible registrar el marcaje.');
+  }finally{
+    markInFlight=false;
+    renderWorker();
+  }
 }
 qs('btnArrival').onclick=()=>mark('arrival');
 qs('btnLunchStart').onclick=()=>mark('lunchStart');
